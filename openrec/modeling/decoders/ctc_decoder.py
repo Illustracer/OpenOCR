@@ -39,6 +39,7 @@ class EncoderWithSVTR(nn.Module):
         kernel_size=[3, 3],
         qk_scale=None,
         use_pool=True,
+        support_ppocr_v4=False,
     ):
         super(EncoderWithSVTR, self).__init__()
         self.depth = depth
@@ -49,12 +50,12 @@ class EncoderWithSVTR(nn.Module):
             in_channels // 8,
             kernel_size=kernel_size,
             padding=[kernel_size[0] // 2, kernel_size[1] // 2],
-            act=Swish,
+            act='swish',
             bias=False)
         self.conv2 = ConvBNLayer(in_channels // 8,
                                  hidden_dims,
                                  kernel_size=1,
-                                 act=Swish,
+                                 act='swish',
                                  bias=False)
 
         self.svtr_block = nn.ModuleList([
@@ -67,7 +68,7 @@ class EncoderWithSVTR(nn.Module):
                 qkv_bias=qkv_bias,
                 qk_scale=qk_scale,
                 drop=drop_rate,
-                act_layer=Swish,
+                act_layer='swish',
                 attn_drop=attn_drop_rate,
                 drop_path=drop_path,
                 norm_layer='nn.LayerNorm',
@@ -79,21 +80,27 @@ class EncoderWithSVTR(nn.Module):
         self.conv3 = ConvBNLayer(hidden_dims,
                                  in_channels,
                                  kernel_size=1,
-                                 act=Swish,
+                                 act='swish',
                                  bias=False)
         # last conv-nxn, the input is concat of input tensor and conv3 output tensor
-        self.conv4 = ConvBNLayer(
-            2 * in_channels,
-            in_channels // 8,
-            kernel_size=kernel_size,
-            padding=[kernel_size[0] // 2, kernel_size[1] // 2],
-            act=Swish,
-            bias=False)
+        if support_ppocr_v4:
+            self.conv4 = ConvBNLayer(
+                2 * in_channels, in_channels // 8, padding=1, act="swish", bias=False
+            )
+        else:
+            self.conv4 = ConvBNLayer(
+                2 * in_channels,
+                in_channels // 8,
+                kernel_size=kernel_size,
+                padding=[kernel_size[0] // 2, kernel_size[1] // 2],
+                act="swish",
+                bias=False,
+            )
 
         self.conv1x1 = ConvBNLayer(in_channels // 8,
                                    dims,
                                    kernel_size=1,
-                                   act=Swish,
+                                   act='swish',
                                    bias=False)
         self.out_channels = dims
         self.apply(self._init_weights)

@@ -104,7 +104,10 @@ class Act(nn.Module):
     def __init__(self, act='hard_swish', lr_mult=1.0, lab_lr=0.1):
         super().__init__()
         assert act in ['hard_swish', 'relu']
-        self.act = Activation(act)
+        if act == "hard_swish":
+            self.act = nn.Hardswish(inplace=True)
+        else:
+            self.act = Activation(act)
         self.lab = LearnableAffineBlock(lr_mult=lr_mult, lab_lr=lab_lr)
 
     def forward(self, x):
@@ -276,7 +279,8 @@ class SELayer(nn.Module):
             stride=1,
             padding=0,
         )
-        self.hardsigmoid = Activation('hard_sigmoid')
+        self.hardsigmoid = nn.Hardsigmoid(inplace=True)
+        # self.hardsigmoid = Activation('hard_sigmoid')
 
     def forward(self, x):
         identity = x

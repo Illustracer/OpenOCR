@@ -155,6 +155,15 @@ def set_device(device, numId=0):
     return device
 
 
+def find_layers_by_name(model, layer_name):
+    """根据类名字符串查找层"""
+    found_layers = []
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == layer_name:
+            found_layers.append((name, module))
+    return found_layers
+
+
 class OpenRecognizer:
 
     def __init__(self,
@@ -208,7 +217,7 @@ class OpenRecognizer:
         self.transform = transform
         # 构建预处理流程
         algorithm_name = self.cfg['Architecture']['algorithm']
-        if algorithm_name in ['SVTRv2_mobile', 'SVTRv2_server']:
+        if algorithm_name in ['SVTRv2_mobile', 'SVTRv2_server', 'SVTR_LCNet']:
             self.cfg['Global']['character_dict_path'] = DEFAULT_DICT_PATH_REC
         self.post_process_class = build_post_process(self.cfg['PostProcess'],
                                                      self.cfg['Global'])
@@ -236,7 +245,7 @@ class OpenRecognizer:
         else:
             # PyTorch专用初始化
             algorithm_name = self.cfg['Architecture']['algorithm']
-            if algorithm_name in ['SVTRv2_mobile', 'SVTRv2_server']:
+            if algorithm_name in ['SVTRv2_mobile', 'SVTRv2_server', 'SVTR_LCNet']:
                 if not os.path.exists(self.cfg['Global']['pretrained_model']):
                     pretrained_model = check_and_download_model(
                         MODEL_NAME_REC, DOWNLOAD_URL_REC
@@ -248,6 +257,13 @@ class OpenRecognizer:
             self.model = build_rec_model(self.cfg['Architecture'])
 
         load_ckpt(self.model, self.cfg)
+
+        # PPOCRv4 Rep
+        if algorithm_name == 'SVTR_LCNet':
+            rep_layers = find_layers_by_name(self.model, "LearnableRepLayer")
+            for name, layer in rep_layers:
+                if hasattr(layer, "rep") and not getattr(layer, "is_repped"):
+                    layer.rep()
 
         self.device = set_device(self.cfg['Global']['device'], numId)
         self.model.to(self.device)

@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn.init import kaiming_normal_, ones_, trunc_normal_, zeros_
 
 from openrec.modeling.common import DropPath, Identity, Mlp
+from openrec.modeling.common import Activation
 
 
 class ConvBNLayer(nn.Module):
@@ -30,7 +31,10 @@ class ConvBNLayer(nn.Module):
             bias=bias,
         )
         self.norm = nn.BatchNorm2d(out_channels)
-        self.act = act()
+        if isinstance(act, str):
+            self.act = Activation(act_type=act, inplace=True)
+        else:
+            self.act = act()
 
     def forward(self, inputs):
         out = self.conv(inputs)

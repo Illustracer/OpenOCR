@@ -37,3 +37,5 @@ test_tipc/web/models/
 test_tipc/web/node_modules/
 ppocr/
 .idea/
+
+scripts/
