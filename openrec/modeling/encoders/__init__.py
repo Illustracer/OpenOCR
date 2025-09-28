@@ -7,6 +7,7 @@ name_to_module = {
     'ResNet31': '.rec_resnet_31',
     'MobileNetV3': '.rec_mobilenet_v3',
     'PPLCNetV3': '.rec_lcnetv3',
+    'QuantizablePPLCNetV3': '.rec_lcnetv3_quant',
     'PPHGNet_small': '.rec_hgnet',
     'ResNet': '.rec_resnet_vd',
     'MTB': '.rec_nrtr_mtb',

@@ -10,6 +10,7 @@ class_to_module = {
     'CPPDDecoder': '.cppd_decoder',
     'RCTCDecoder': '.rctc_decoder',
     'CTCDecoder': '.ctc_decoder',
+    'QuantizedCTCDecoder': '.ctc_decoder_quant',
     'DANDecoder': '.dan_decoder',
     'IGTRDecoder': '.igtr_decoder',
     'LISTERDecoder': '.lister_decoder',

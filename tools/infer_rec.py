@@ -217,8 +217,11 @@ class OpenRecognizer:
         self.transform = transform
         # 构建预处理流程
         algorithm_name = self.cfg['Architecture']['algorithm']
-        if algorithm_name in ['SVTRv2_mobile', 'SVTRv2_server', 'SVTR_LCNet']:
-            self.cfg['Global']['character_dict_path'] = DEFAULT_DICT_PATH_REC
+        if (
+            algorithm_name in ["SVTRv2_mobile", "SVTRv2_server", "SVTR_LCNet"]
+            and self.cfg["Global"]["character_dict_path"] is None
+        ):
+            self.cfg["Global"]["character_dict_path"] = DEFAULT_DICT_PATH_REC
         self.post_process_class = build_post_process(self.cfg['PostProcess'],
                                                      self.cfg['Global'])
         char_num = self.post_process_class.get_character_num()
