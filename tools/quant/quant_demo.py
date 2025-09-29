@@ -69,17 +69,19 @@ def prepare_qat_model(model: nn.Module, backend: str) -> None:
 
     # 设置全局配置
     model.qconfig = torch.quantization.get_default_qat_qconfig(backend)
-    model.fuse_model(is_qat=True)  # type: ignore[operator]
-    torch.ao.quantization.prepare_qat(model, inplace=False)
 
     # 如果模型有禁用量化的方法，调用它
     if hasattr(model, "disable_svtr_quantization"):
         model.disable_svtr_quantization()
+
+    model.fuse_model(is_qat=True)  # type: ignore[operator]
+    qat_model = torch.ao.quantization.prepare_qat(model, inplace=False)
+    print("=== QAT模型准备完成 ===")
+
+    # 如果模型有禁用量化的方法，调用它
     if hasattr(model, "disable_lab_quantization"):
         model.disable_lab_quantization()
-    if hasattr(model, "disable_quant_layers"):
-        model.disable_quant_layers()
-    print("=== QAT模型准备完成 ===")
+    return qat_model
 
 
 def finalize_qat_model(qat_model):
@@ -89,7 +91,7 @@ def finalize_qat_model(qat_model):
     print("=== 完成QAT量化 ===")
     qat_model = qat_model.to("cpu")
     qat_model.eval()
-    quantized_model = torch.quantization.convert(qat_model, inplace=False)
+    quantized_model = torch.quantization.convert(qat_model, inplace=True)
     print("=== QAT量化完成 ===")
     return quantized_model
 
@@ -152,7 +154,7 @@ def debug_quantization_status(model, prefix=""):
             )
 
 
-def quant_lcnet():
+def quant_lcnet(quant_method="static"):
     backend = "qnnpack"
 
     # ======== 模型导出定义 =========
@@ -177,15 +179,25 @@ def quant_lcnet():
             layer.rep()
     _replace_relu(quant_model)
 
-    # ======== 步骤2: 模型量化(静态) =========
-    quantize_model(quant_model, backend, example_inputs)
-    debug_quantized_model(quant_model, example_inputs)
-    export_onnx_model(
-        quant_model, example_inputs, dynamic_axes, "./output/PPLCNet-v3-quant.onnx"
-    )
+    # ======== 步骤2: 模型量化(Static) =========
+    if quant_method == "static":
+        quantize_model(quant_model, backend, example_inputs)
+        debug_quantized_model(quant_model, example_inputs)
+        export_onnx_model(
+            quant_model, example_inputs, dynamic_axes, "./output/PPLCNetv3-quant.onnx"
+        )
+
+    # ======== 步骤2: 模型量化(QAT) =========
+    if quant_method == "qat":
+        qat_model = prepare_qat_model(quant_model, backend)
+        qat_model = finalize_qat_model(qat_model)
+        debug_quantized_model(qat_model, example_inputs)
+        export_onnx_model(
+            qat_model, example_inputs, dynamic_axes, "./output/PPLCNetv3-qat-quant.onnx"
+        )
 
 
-def quant_ctc():
+def quant_ctc(quant_method="static"):
     backend = "qnnpack"
 
     # ======== 模型导出定义 =========
@@ -224,12 +236,22 @@ def quant_ctc():
     )
     _replace_relu(quant_model)
 
-    # ======== 步骤2: 模型量化 =========
-    quantize_model(quant_model, backend, example_inputs)
-    debug_quantized_model(quant_model, example_inputs)
-    export_onnx_model(
-        quant_model, example_inputs, dynamic_axes, "./output/CTCDecoder-quant.onnx"
-    )
+    # ======== 步骤2: 模型量化(Static) =========
+    if quant_method == "static":
+        quantize_model(quant_model, backend, example_inputs)
+        debug_quantized_model(quant_model, example_inputs)
+        export_onnx_model(
+            quant_model, example_inputs, dynamic_axes, "./output/CTCDecoder-quant.onnx"
+        )
+
+    # ======== 步骤2: 模型量化(QAT) =========
+    if quant_method == "qat":
+        qat_model = prepare_qat_model(quant_model, backend)
+        qat_model = finalize_qat_model(qat_model)
+        debug_quantized_model(qat_model, example_inputs)
+        export_onnx_model(
+            qat_model, example_inputs, dynamic_axes, "./output/CTCDecoder-qat-quant.onnx"
+        )
 
 
 def quant_rec_model(quant_method="static"):
@@ -282,16 +304,15 @@ def quant_rec_model(quant_method="static"):
 
     # ======== 步骤2: 模型量化(QAT) =========
     if quant_method == "qat":
-        prepare_qat_model(quant_model, backend)
-        # TODO: 增加 QAT 训练
-        finalize_qat_model(quant_model)
-        debug_quantized_model(quant_model, example_inputs)
+        qat_model = prepare_qat_model(quant_model, backend)
+        qat_model = finalize_qat_model(qat_model)
+        debug_quantized_model(qat_model, example_inputs)
         export_onnx_model(
-            quant_model, example_inputs, dynamic_axes, "./output/PPLCNet-v3-quant.onnx"
+            qat_model, example_inputs, dynamic_axes, "./output/PPOCR-v4-qat-quant.onnx"
         )
 
 
 if __name__ == "__main__":
-    # quant_lcnet()
-    # quant_ctc()
-    quant_rec_model(quant_method="static")
+    # quant_lcnet(quant_method="qat")
+    # quant_ctc(quant_method="qat")
+    quant_rec_model(quant_method="qat")

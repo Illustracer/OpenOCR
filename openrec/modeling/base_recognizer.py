@@ -74,8 +74,12 @@ class BaseRecognizer(nn.Module):
         if self.use_decoder and hasattr(self.decoder, "fuse_model"):
             self.decoder.fuse_model(is_qat)
 
-    def disable_quant_layers(self):
+    def disable_svtr_quantization(self):
+        """专门禁用SVTR量化"""
         if self.use_decoder and hasattr(self.decoder, "disable_svtr_quantization"):
             self.decoder.disable_svtr_quantization()
+
+    def disable_lab_quantization(self):
+        """专门禁用LAB量化"""
         if self.use_encoder and hasattr(self.encoder, "disable_lab_quantization"):
             self.encoder.disable_lab_quantization()
