@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(__dir__, '..')))
 
 from tools.engine.config import Config
 from tools.engine.trainer import Trainer
+from tools.engine.quant_trainer import QuantTrainer
 from tools.utility import ArgsParser
 
 
@@ -30,9 +31,14 @@ def main():
     opt = FLAGS.pop('opt')
     cfg.merge_dict(FLAGS)
     cfg.merge_dict(opt)
-    trainer = Trainer(cfg,
-                      mode='train_eval' if FLAGS['eval'] else 'train',
-                      task='rec')
+    if cfg.cfg.get("quant", False):
+        trainer = QuantTrainer(cfg,
+                        mode='train_eval' if FLAGS['eval'] else 'train',
+                        task='rec')
+    else:
+        trainer = Trainer(cfg,
+                        mode='train_eval' if FLAGS['eval'] else 'train',
+                        task='rec')
     trainer.train()
 
 

@@ -59,13 +59,13 @@ class BaseRecognizer(nn.Module):
         else:
             return {}
 
-    def forward(self, x):
+    def forward(self, x, data=None):
         if self.use_transform:
             x = self.transform(x)
         if self.use_encoder:
             x = self.encoder(x)
         if self.use_decoder:
-            x = self.decoder(x)
+            x = self.decoder(x, data=data)
         return x
 
     def fuse_model(self, is_qat=None):

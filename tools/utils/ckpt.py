@@ -79,7 +79,7 @@ def load_ckpt(model, cfg, optimizer=None, lr_scheduler=None, logger=None):
 
 
 def load_pretrained_params(model, pretrained_model, logger):
-    checkpoint = torch.load(pretrained_model, map_location=torch.device("cpu"))
+    checkpoint = torch.load(pretrained_model, map_location=torch.device("cpu"), weights_only=True)
     model.load_state_dict(checkpoint["state_dict"], strict=False)
     for name in model.state_dict().keys():
         if name not in checkpoint["state_dict"]:

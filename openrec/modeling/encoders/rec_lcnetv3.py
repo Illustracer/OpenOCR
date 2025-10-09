@@ -239,10 +239,12 @@ class LearnableRepLayer(nn.Module):
             assert isinstance(branch, nn.BatchNorm2d)
             if not hasattr(self, 'id_tensor'):
                 input_dim = self.in_channels // self.groups
+                device = branch.weight.device
                 kernel_value = torch.zeros(
                     (self.in_channels, input_dim, self.kernel_size,
                      self.kernel_size),
                     dtype=branch.weight.dtype,
+                    device=device,
                 )
                 for i in range(self.in_channels):
                     kernel_value[i, i % input_dim, self.kernel_size // 2,
