@@ -17,6 +17,15 @@ from tools.utils.utility import AverageMeter
 __all__ = ['Trainer']
 
 
+def find_layers_by_name(model, layer_name):
+    """根据类名字符串查找层"""
+    found_layers = []
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == layer_name:
+            found_layers.append((name, module))
+    return found_layers
+
+
 def get_parameter_number(model):
     total_num = sum(p.numel() for p in model.parameters())
     trainable_num = sum(p.numel() for p in model.parameters()
@@ -126,7 +135,7 @@ class Trainer(object):
 
         if self.cfg['Global']['distributed']:
             self.model = torch.nn.parallel.DistributedDataParallel(
-                self.model, [self.local_rank], find_unused_parameters=False)
+                self.model, [self.local_rank], find_unused_parameters=True)
 
         # amp
         self.scaler = (torch.cuda.amp.GradScaler() if self.cfg['Global'].get(
@@ -149,6 +158,7 @@ class Trainer(object):
         char_num = self.post_process_class.get_character_num()
         self.cfg['Architecture']['Decoder']['out_channels'] = char_num
         self.model = build_rec_model(self.cfg['Architecture'])
+
         # build loss
         self.loss_class = build_rec_loss(self.cfg['Loss'])
         # build metric

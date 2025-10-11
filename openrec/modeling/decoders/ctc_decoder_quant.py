@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from typing import Any, Optional, Union
 from openrec.modeling.common import Mlp
@@ -25,6 +24,40 @@ def _fuse_modules(
     return method(model, modules_to_fuse, **kwargs)
 
 
+class PACT(nn.Module):
+    """
+    PACT: Parameterized Clipping Activation for Quantization
+    Paper: https://arxiv.org/abs/1805.06085
+    
+    将激活值裁剪到 [-alpha, alpha] 范围内，alpha 是可学习参数
+    """
+    def __init__(self, alpha_init=20.0, learn_alpha=True):
+        super(PACT, self).__init__()
+        
+        # 创建可学习的 alpha 参数
+        if learn_alpha:
+            self.alpha = nn.Parameter(
+                torch.tensor([alpha_init], dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                'alpha', 
+                torch.tensor([alpha_init], dtype=torch.float32)
+            )
+        self.learn_alpha = learn_alpha
+
+    def forward(self, x):
+        """
+        将 x 裁剪到 [-alpha, alpha] 范围
+        等价于: x = clip(x, -alpha, alpha)
+        """
+        x = torch.clamp(x, min=-self.alpha, max=self.alpha)
+        return x
+    
+    def extra_repr(self):
+        return f'alpha={self.alpha.item():.4f}, learn_alpha={self.learn_alpha}'
+
+
 class QuantizedAttention(Attention):
     def __init__(
         self,
@@ -37,6 +70,7 @@ class QuantizedAttention(Attention):
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
+        use_pact=True,
     ):
         super().__init__(
             dim=dim,
@@ -58,10 +92,19 @@ class QuantizedAttention(Attention):
         self.quant_proj = torch.quantization.QuantStub()
         self.dequant_proj = torch.quantization.DeQuantStub()
 
+        # PACT 预处理层（在量化之前）
+        self.use_pact = use_pact
+        if use_pact:
+            pact_alpha_init = 20.0
+            self.pact1 = PACT(alpha_init=pact_alpha_init)  # fc1 输入前
+            self.pact2 = PACT(alpha_init=pact_alpha_init)  # fc2 输入前
+
     def forward(self, x):
         B, N, _ = x.shape
 
         # qkv 量化计算
+        if self.use_pact:
+            x = self.pact1(x)
         x = self.quant_qkv(x)      # 量化输入
         qkv = self.qkv(x)           # 量化的 Linear
         qkv = self.dequant_qkv(qkv) # 反量化输出
@@ -80,6 +123,8 @@ class QuantizedAttention(Attention):
         x = x.transpose(1, 2).reshape(B, N, self.dim)
 
         # proj 量化计算
+        if self.use_pact:
+            x = self.pact2(x)
         x = self.quant_proj(x)      # 量化输入
         x = self.proj(x)            # 量化的 Linear
         x = self.dequant_proj(x)    # 反量化输出
@@ -90,6 +135,9 @@ class QuantizedAttention(Attention):
     def disable_svtr_quantization(self):
         self.attn_drop.qconfig = None
         self.proj_drop.qconfig = None
+        if self.use_pact:
+            self.pact1.qconfig = None
+            self.pact2.qconfig = None
 
 
 class QuantizedMlp(Mlp):
@@ -101,6 +149,7 @@ class QuantizedMlp(Mlp):
         out_features=None,
         act_layer=nn.GELU,
         drop=0.0,
+        use_pact=True,
     ):
         super().__init__(in_features, hidden_features, out_features, act_layer, drop)
 
@@ -109,12 +158,26 @@ class QuantizedMlp(Mlp):
         self.quant2 = torch.quantization.QuantStub()
         self.dequant2 = torch.quantization.DeQuantStub()
 
+        # PACT 预处理层（在量化之前）
+        self.use_pact = use_pact
+        if use_pact:
+            pact_alpha_init = 20.0
+            self.pact1 = PACT(alpha_init=pact_alpha_init)  # fc1 输入前
+            self.pact2 = PACT(alpha_init=pact_alpha_init)  # fc2 输入前
+
     def forward(self, x):
+        # PACT 预处理（裁剪激活值范围）
+        if self.use_pact:
+            x = self.pact1(x)
         x = self.quant1(x)
         x = self.fc1(x)
         x = self.dequant1(x)
         x = self.act(x)
         x = self.drop(x)
+
+        # PACT 预处理
+        if self.use_pact:
+            x = self.pact2(x)
         x = self.quant2(x)
         x = self.fc2(x)
         x = self.dequant2(x)
@@ -130,6 +193,9 @@ class QuantizedMlp(Mlp):
         for module in self.act.modules():
             module.qconfig = None
         self.drop.qconfig = None
+        if self.use_pact:
+            self.pact1.qconfig = None
+            self.pact2.qconfig = None
 
 
 class QuantizedConvBNLayer(ConvBNLayer):
@@ -143,6 +209,7 @@ class QuantizedConvBNLayer(ConvBNLayer):
         bias=False,
         groups=1,
         act="swish",  # 固定为swish
+        use_pact=False,
     ):
         super().__init__(
             in_channels, out_channels, kernel_size, stride, padding, bias, groups, act
@@ -150,15 +217,33 @@ class QuantizedConvBNLayer(ConvBNLayer):
         # NOTE: 这里必须这样写, 否则有问题
         self.act = nn.Hardswish(inplace=True)
 
+        # 量化/反量化桩
+        self.quant = torch.quantization.QuantStub()
+        self.dequant = torch.quantization.DeQuantStub()
+
+        self.use_pact = use_pact
+        if use_pact:
+            pact_alpha_init = 20.0
+            self.pact = PACT(alpha_init=pact_alpha_init)  # fc1 输入前
+
     def forward(self, inputs):
+        if self.use_pact:
+            inputs = self.pact(inputs)
+        inputs = self.quant(inputs)
         out = self.conv(inputs)
         out = self.norm(out)
+        out = self.dequant(out)
         out = self.act(out)
         return out
 
     def fuse_model(self, is_qat=None):
         """融合Conv+BN操作"""
         _fuse_modules(self, [["conv", "norm"]], inplace=True, is_qat=is_qat)
+
+    def disable_svtr_quantization(self):
+        self.act.qconfig = None
+        if self.use_pact:
+            self.pact.qconfig = None
 
 
 class QuantizedBlock(Block):
@@ -179,6 +264,7 @@ class QuantizedBlock(Block):
         norm_layer='nn.LayerNorm',
         eps=1e-6,
         prenorm=True,
+        use_pact=True,
     ):
         super().__init__(
             dim=dim,
@@ -204,6 +290,7 @@ class QuantizedBlock(Block):
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
             drop=drop,
+            use_pact=use_pact,
         )
 
         if mixer == 'Global' or mixer == 'Local':
@@ -217,6 +304,7 @@ class QuantizedBlock(Block):
                 qk_scale=qk_scale,
                 attn_drop=attn_drop,
                 proj_drop=drop,
+                use_pact=use_pact,
             )
 
     def forward(self, x):
@@ -254,6 +342,7 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         qk_scale=None,
         use_pool=True,
         support_ppocr_v4=False,
+        use_pact=False,
     ):
         # 先初始化父类以获得所有基本属性
         super().__init__(
@@ -282,20 +371,21 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
             padding=[kernel_size[0] // 2, kernel_size[1] // 2],
             act="swish",
             bias=False,
+            use_pact=False,
         )
 
         self.conv2 = QuantizedConvBNLayer(
-            in_channels // 8, hidden_dims, kernel_size=1, act="swish", bias=False
+            in_channels // 8, hidden_dims, kernel_size=1, act="swish", bias=False, use_pact=False,
         )
 
         self.conv3 = QuantizedConvBNLayer(
-            hidden_dims, in_channels, kernel_size=1, act="swish", bias=False
+            hidden_dims, in_channels, kernel_size=1, act="swish", bias=False, use_pact=False,
         )
 
         # conv4根据support_ppocr_v4参数设置
         if support_ppocr_v4:
             self.conv4 = QuantizedConvBNLayer(
-                2 * in_channels, in_channels // 8, padding=1, act="swish", bias=False
+                2 * in_channels, in_channels // 8, padding=1, act="swish", bias=False, use_pact=False,
             )
         else:
             self.conv4 = QuantizedConvBNLayer(
@@ -305,10 +395,11 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
                 padding=[kernel_size[0] // 2, kernel_size[1] // 2],
                 act="swish",
                 bias=False,
+                use_pact=False,
             )
 
         self.conv1x1 = QuantizedConvBNLayer(
-            in_channels // 8, dims, kernel_size=1, act="swish", bias=False
+            in_channels // 8, dims, kernel_size=1, act="swish", bias=False, use_pact=False,
         )
 
         self.svtr_block = nn.ModuleList([
@@ -327,17 +418,9 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
                 norm_layer='nn.LayerNorm',
                 eps=1e-05,
                 prenorm=False,
+                use_pact=use_pact,
             ) for i in range(depth)
         ])
-
-        # 添加量化相关的FloatFunctional操作
-        self.cat_func = torch.nn.quantized.FloatFunctional()  # 用于torch.concat
-
-        self.input_quant = torch.quantization.QuantStub()
-        self.input_dequant = torch.quantization.DeQuantStub()
-
-        self.block_dequant = torch.quantization.DeQuantStub()
-        self.block_quant = torch.quantization.QuantStub()
 
     def forward(self, x):
         if self.use_pool:
@@ -349,7 +432,6 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         else:
             z = x
 
-        z = self.input_quant(z)
         # for short cut
         h = z
 
@@ -357,7 +439,6 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         z = self.conv1(z)
         z = self.conv2(z)
 
-        z = self.block_dequant(z)
         # SVTR global block - 保持原有精度
         B, C, H, W = z.shape
         z = z.flatten(2).transpose(1, 2).contiguous()
@@ -369,15 +450,11 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
 
         # last stage - 使用量化的ConvBN层
         z = z.reshape(-1, H, W, C).permute(0, 3, 1, 2)
-        z = self.block_quant(z)
-
         z = self.conv3(z)
 
         # 使用FloatFunctional进行concat操作
-        z = self.cat_func.cat([h, z], dim=1)
+        z = torch.cat((h, z), dim=1)
         z = self.conv1x1(self.conv4(z))
-
-        z = self.input_dequant(z)
         return z
 
     def fuse_model(self, is_qat=None):
@@ -393,6 +470,12 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         # 禁用LayerNorm
         if hasattr(self, "norm"):
             self.norm.qconfig = None
+
+        self.conv1.disable_svtr_quantization()
+        self.conv2.disable_svtr_quantization()
+        self.conv3.disable_svtr_quantization()
+        self.conv4.disable_svtr_quantization()
+        self.conv1x1.disable_svtr_quantization()
 
         # 禁用SVTR blocks
         for blk in self.svtr_block:
@@ -428,6 +511,11 @@ class QuantizedCTCDecoder(CTCDecoder):
         self.fc_quant = torch.quantization.QuantStub()
         self.fc_dequant = torch.quantization.DeQuantStub()
 
+        self.use_pact = kwargs.get('use_pact', False)
+        if self.use_pact:
+            pact_alpha_init = 20.0
+            self.pact = PACT(alpha_init=pact_alpha_init)  # fc1 输入前
+
     def forward(self, x):
         # SVTR编码器处理（如果存在）
         if self.svtr_encoder is not None:
@@ -435,6 +523,8 @@ class QuantizedCTCDecoder(CTCDecoder):
             x = x.flatten(2).transpose(1, 2)
 
         # 输入量化
+        if self.use_pact:
+            x = self.pact(x)
         x = self.fc_quant(x)
 
         # 全连接层处理
@@ -459,7 +549,6 @@ class QuantizedCTCDecoder(CTCDecoder):
         if not self.training:
             predicts = F.softmax(predicts, dim=2)
             result = predicts
-
         return result
 
     def fuse_model(self, is_qat=None):

@@ -24,6 +24,40 @@ def _fuse_modules(
     return method(model, modules_to_fuse, **kwargs)
 
 
+class PACT(nn.Module):
+    """
+    PACT: Parameterized Clipping Activation for Quantization
+    Paper: https://arxiv.org/abs/1805.06085
+    
+    将激活值裁剪到 [-alpha, alpha] 范围内，alpha 是可学习参数
+    """
+    def __init__(self, alpha_init=20.0, learn_alpha=True):
+        super(PACT, self).__init__()
+        
+        # 创建可学习的 alpha 参数
+        if learn_alpha:
+            self.alpha = nn.Parameter(
+                torch.tensor([alpha_init], dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                'alpha', 
+                torch.tensor([alpha_init], dtype=torch.float32)
+            )
+        self.learn_alpha = learn_alpha
+
+    def forward(self, x):
+        """
+        将 x 裁剪到 [-alpha, alpha] 范围
+        等价于: x = clip(x, -alpha, alpha)
+        """
+        x = torch.clamp(x, min=-self.alpha, max=self.alpha)
+        return x
+    
+    def extra_repr(self):
+        return f'alpha={self.alpha.item():.4f}, learn_alpha={self.learn_alpha}'
+
+
 class QuantizableAct(Act):
     def __init__(self, act="hard_swish", lr_mult=1.0, lab_lr=0.1):
         super().__init__(act, lr_mult, lab_lr)
@@ -129,6 +163,7 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
         num_conv_branches=1,
         lr_mult=1.0,
         lab_lr=0.1,
+        use_pact=False,
     ):
         super().__init__(
             in_channels,
@@ -152,6 +187,12 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
         self.conv_quant = torch.quantization.QuantStub()
         self.conv_dequant = torch.quantization.DeQuantStub()
 
+        # PACT 预处理层（在量化之前）
+        self.use_pact = use_pact
+        if use_pact:
+            pact_alpha_init = 20.0
+            self.pact = PACT(alpha_init=pact_alpha_init)
+
     def rep(self):
         """调用基类的rep方法"""
         super().rep()
@@ -160,6 +201,8 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
         # rep后的模型（只考虑这种情况）
         if self.is_repped:
             # 修改：在 reparam_conv 前后添加 quant/dequant
+            if self.use_pact:
+                x = self.pact(x)
             out = self.conv_quant(x)
             out = self.reparam_conv(out)
             out = self.conv_dequant(out)
@@ -200,6 +243,8 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
         """禁用 reparam_conv 的量化"""
         self.conv_quant.qconfig = None
         self.conv_dequant.qconfig = None
+        if self.use_pact:
+            self.pact.qconfig = None
 
 
 class QuantizableLCNetV3Block(LCNetV3Block):
@@ -213,6 +258,7 @@ class QuantizableLCNetV3Block(LCNetV3Block):
         conv_kxk_num=4,
         lr_mult=1.0,
         lab_lr=0.1,
+        use_pact=False,
     ):
         super().__init__(
             in_channels,
@@ -235,6 +281,7 @@ class QuantizableLCNetV3Block(LCNetV3Block):
             num_conv_branches=conv_kxk_num,
             lr_mult=lr_mult,
             lab_lr=lab_lr,
+            use_pact=use_pact,
         )
 
         # SE 模块不能量化
@@ -249,6 +296,7 @@ class QuantizableLCNetV3Block(LCNetV3Block):
             num_conv_branches=conv_kxk_num,
             lr_mult=lr_mult,
             lab_lr=lab_lr,
+            use_pact=use_pact,
         )
 
     def forward(self, x):
