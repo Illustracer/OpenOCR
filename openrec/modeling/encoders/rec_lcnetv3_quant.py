@@ -100,13 +100,13 @@ class QuantizableLearnableAffineBlock(LearnableAffineBlock):
         # self.mul_add = torch.nn.quantized.FloatFunctional()
 
         # 添加量化控制
-        self.input_dequant = torch.quantization.DeQuantStub()
-        self.output_quant = torch.quantization.QuantStub()
+        # self.input_dequant = torch.quantization.DeQuantStub()
+        # self.output_quant = torch.quantization.QuantStub()
 
     def forward(self, x):
-        x = self.input_dequant(x)
+        # x = self.input_dequant(x)
         x = self.scale * x + self.bias
-        x = self.output_quant(x)
+        # x = self.output_quant(x)
         return x
 
     def fuse_model(self, is_qat=None):
@@ -142,11 +142,15 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
         )
 
         # 替换为量化版本的子模块
-        self.lab = QuantizableLearnableAffineBlock(lr_mult=lr_mult, lab_lr=lab_lr)
-        self.act = QuantizableAct(lr_mult=lr_mult, lab_lr=lab_lr)
+        # self.lab = QuantizableLearnableAffineBlock(lr_mult=lr_mult, lab_lr=lab_lr)
+        # self.act = QuantizableAct(lr_mult=lr_mult, lab_lr=lab_lr)
 
         # 添加量化友好的加法操作（用于非rep状态）
         self.add = torch.nn.quantized.FloatFunctional()
+
+        # 新增：为 reparam_conv 添加 quant/dequant stub
+        self.conv_quant = torch.quantization.QuantStub()
+        self.conv_dequant = torch.quantization.DeQuantStub()
 
     def rep(self):
         """调用基类的rep方法"""
@@ -155,7 +159,10 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
     def forward(self, x):
         # rep后的模型（只考虑这种情况）
         if self.is_repped:
-            out = self.reparam_conv(x)
+            # 修改：在 reparam_conv 前后添加 quant/dequant
+            out = self.conv_quant(x)
+            out = self.reparam_conv(out)
+            out = self.conv_dequant(out)
             out = self.lab(out)
             if self.stride != 2:
                 out = self.act(out)
@@ -181,18 +188,18 @@ class QuantizableLearnableRepLayer(LearnableRepLayer):
             # rep后只有一个conv，无需融合
             pass
 
-        # 融合子模块
-        if hasattr(self, "lab"):
-            pass
-        if hasattr(self, "act"):
-            pass
-
     def disable_lab_quantization(self):
         """禁用 LAB 相关模块的量化"""
-        if hasattr(self, "act"):
+        if hasattr(self, "act") and hasattr(self.act, "disable_lab_quantization"):
             self.act.disable_lab_quantization()
-        if hasattr(self, "lab"):
+        if hasattr(self, "lab") and hasattr(self.lab, "disable_lab_quantization"):
             self.lab.disable_lab_quantization()
+
+    # 新增：禁用 reparam_conv 的量化
+    def disable_conv_quantization(self):
+        """禁用 reparam_conv 的量化"""
+        self.conv_quant.qconfig = None
+        self.conv_dequant.qconfig = None
 
 
 class QuantizableLCNetV3Block(LCNetV3Block):
@@ -230,8 +237,9 @@ class QuantizableLCNetV3Block(LCNetV3Block):
             lab_lr=lab_lr,
         )
 
-        if use_se:
-            self.se = QuantizableSELayer(in_channels, lr_mult=lr_mult)
+        # SE 模块不能量化
+        # if use_se:
+            # self.se = QuantizableSELayer(in_channels, lr_mult=lr_mult)
 
         self.pw_conv = QuantizableLearnableRepLayer(
             in_channels=in_channels,
@@ -254,7 +262,7 @@ class QuantizableLCNetV3Block(LCNetV3Block):
         """融合子模块"""
         if hasattr(self, "dw_conv"):
             self.dw_conv.fuse_model(is_qat)
-        if hasattr(self, "se") and self.use_se:
+        if hasattr(self, "se") and self.use_se and hasattr(self.se, "fuse_model"):
             self.se.fuse_model(is_qat)
         if hasattr(self, "pw_conv"):
             self.pw_conv.fuse_model(is_qat)
@@ -263,6 +271,14 @@ class QuantizableLCNetV3Block(LCNetV3Block):
         """禁用 LAB 相关模块的量化"""
         self.dw_conv.disable_lab_quantization()
         self.pw_conv.disable_lab_quantization()
+
+    # 新增：禁用 conv 的量化
+    def disable_conv_quantization(self):
+        """禁用 dw_conv 和 pw_conv 的量化"""
+        if hasattr(self.dw_conv, 'disable_conv_quantization'):
+            self.dw_conv.disable_conv_quantization()
+        if hasattr(self.pw_conv, 'disable_conv_quantization'):
+            self.pw_conv.disable_conv_quantization()
 
 
 class QuantizablePPLCNetV3(PPLCNetV3):
@@ -277,14 +293,14 @@ class QuantizablePPLCNetV3(PPLCNetV3):
     ):
         super().__init__(scale, conv_kxk_num, lr_mult_list, lab_lr, det, **kwargs)
 
-        # 替换为量化版本的第一层卷积
-        self.conv1 = QuantizableConvBNLayer(
-            in_channels=3,
-            out_channels=make_divisible(16 * scale),
-            kernel_size=3,
-            stride=2,
-            lr_mult=self.lr_mult_list[0],
-        )
+        # NOTE: 第一层不量化
+        # self.conv1 = QuantizableConvBNLayer(
+        #     in_channels=3,
+        #     out_channels=make_divisible(16 * scale),
+        #     kernel_size=3,
+        #     stride=2,
+        #     lr_mult=self.lr_mult_list[0],
+        # )
 
         # 替换所有的 LCNetV3Block 为量化版本
         self.blocks2 = nn.Sequential(
@@ -383,14 +399,15 @@ class QuantizablePPLCNetV3(PPLCNetV3):
                 ]
             )
 
-        # 添加量化相关的量化器
-        self.quant = torch.quantization.QuantStub()
-        self.dequant = torch.quantization.DeQuantStub()
+        # 新增：只在检测模式下添加输出的 dequant
+        if self.det:
+            self.output_dequants = nn.ModuleList([
+                torch.quantization.DeQuantStub() for _ in range(4)
+            ])
+        else:
+            self.output_dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x):
-        # 量化输入
-        x = self.quant(x)
-
         out_list = []
         x = self.conv1(x)
 
@@ -409,8 +426,8 @@ class QuantizablePPLCNetV3(PPLCNetV3):
             for i in range(len(out_list)):
                 out_list[i] = self.layer_list[i](out_list[i])
 
-            # 反量化输出列表
-            out_list = [self.dequant(out) for out in out_list]
+            # 修改：只在输出时反量化
+            out_list = [self.output_dequants[i](out) for i, out in enumerate(out_list)]
             return out_list
 
         # 识别模式
@@ -418,15 +435,12 @@ class QuantizablePPLCNetV3(PPLCNetV3):
             x = F.adaptive_avg_pool2d(x, [1, 40])
         else:
             x = F.avg_pool2d(x, [3, 2])
-
-        # 反量化输出
-        x = self.dequant(x)
         return x
 
     def fuse_model(self, is_qat=None):
         """融合整个模型的所有层"""
         # 融合第一层
-        if hasattr(self, "conv1"):
+        if hasattr(self, "conv1") and hasattr(self.conv1, "fuse_model"):
             self.conv1.fuse_model(is_qat)
 
         # 融合所有block组
@@ -456,9 +470,40 @@ class QuantizablePPLCNetV3(PPLCNetV3):
             self.blocks2, self.blocks3, self.blocks4, 
             self.blocks5, self.blocks6
         ]
-        
+
         # 遍历所有 block sequences
         for blocks in block_sequences:
             for block in blocks:
                 if hasattr(block, 'disable_lab_quantization'):
                     block.disable_lab_quantization()
+
+    # 选择性禁用 conv 量化
+    def set_quantization_config(self, quant_blocks):
+        """
+        设置哪些 block 需要量化
+
+        Args:
+            quant_blocks: 需要量化的 block 列表，例如:
+                ['blocks6.0', 'blocks6.2', 'blocks6.3']
+        """
+        # 默认禁用所有 block 的 conv 量化
+        all_blocks = {
+            'blocks2': self.blocks2,
+            'blocks3': self.blocks3,
+            'blocks4': self.blocks4,
+            'blocks5': self.blocks5,
+            'blocks6': self.blocks6,
+        }
+
+        for block_name, blocks in all_blocks.items():
+            for i, block in enumerate(blocks):
+                full_name = f"{block_name}.{i}"
+
+                if full_name in quant_blocks:
+                    # 需要量化：不做任何操作（保持默认配置）
+                    print(f"启用量化: {full_name}")
+                else:
+                    # 不需要量化：禁用 conv 量化
+                    if hasattr(block, 'disable_conv_quantization'):
+                        block.disable_conv_quantization()
+                        print(f"禁用量化: {full_name}")

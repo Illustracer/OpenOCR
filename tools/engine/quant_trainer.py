@@ -16,7 +16,7 @@ from tools.utils.logging import get_logger
 from tools.utils.stats import TrainingStats
 from tools.utils.utility import AverageMeter
 
-__all__ = ['Trainer']
+__all__ = ['QuantTrainer']
 
 
 def get_parameter_number(model):
@@ -24,6 +24,14 @@ def get_parameter_number(model):
     trainable_num = sum(p.numel() for p in model.parameters()
                         if p.requires_grad)
     return {'Total': total_num, 'Trainable': trainable_num}
+
+
+def debug_quantized_model(model, dummy_input):
+    """调试量化模型"""
+    with torch.no_grad():
+        _ = model(dummy_input)
+    print("量化模型前向传播成功")
+    return True
 
 
 def find_layers_by_name(model, layer_name):
@@ -45,28 +53,81 @@ def print_model_structure(model: nn.Module, max_depth: int = 5):
             print(f"{indent}{name}: {module.__class__.__name__} [{qconfig_status}]")
 
 
-def prepare_qat_model(model: nn.Module, backend: str, logger) -> None:
+def prepare_qat_model(model: nn.Module, backend: str, logger, quant_modules: list = None) -> None:
+    """
+    准备QAT模型（支持部分量化）
+    
+    Args:
+        quant_modules: 要量化的模块名列表
+            - None: 全部启用（默认）
+            - []: 全部禁用
+            - ['backbone']: 只量化backbone
+            - ['backbone', 'head']: 量化backbone和head
+    """
     if backend not in torch.backends.quantized.supported_engines:
-        raise RuntimeError("Quantized backend not supported ")
+        raise RuntimeError("Quantized backend not supported")
     torch.backends.quantized.engine = backend
-    model.train()
 
-    # 设置全局配置
-    model.qconfig = torch.quantization.get_default_qat_qconfig(backend)
-    logger.info(f"\n=== 使用的QConfig ===")
+    # 2. 切换到train模式
+    model.train()
+    model.fuse_model(is_qat=True)
+
+    # 3. 设置qconfig
+    default_qconfig = torch.quantization.get_default_qat_qconfig(backend)
+    model.qconfig = default_qconfig
+    logger.info("\n=== 使用的QConfig ===")
     logger.info(model.qconfig)
 
-    # 如果模型有禁用量化的方法，调用它
+    # ========== 新增：根据quant_modules设置量化 ==========
+    if quant_modules is not None:
+        logger.info("\n=== 应用部分量化配置 ===")
+
+        if len(quant_modules) == 0:
+            # 空列表 = 全部禁用
+            logger.info("禁用所有模块的量化")
+            for name, module in model.named_modules():
+                module.qconfig = None
+        else:
+            # 只启用指定模块
+            logger.info(f"只量化以下模块: {quant_modules}")
+
+            enabled_count = 0
+            disabled_count = 0
+
+            for name, module in model.named_modules():
+                # 检查模块名是否在quant_modules中
+                should_quantize = False
+
+                for quant_module in quant_modules:
+                    # 精确匹配或前缀匹配
+                    if name == quant_module or name.startswith(quant_module + '.'):
+                        should_quantize = True
+                        break
+
+                if should_quantize:
+                    module.qconfig = default_qconfig
+                    enabled_count += 1
+                else:
+                    module.qconfig = None
+                    disabled_count += 1
+
+            logger.info(f"  启用量化: {enabled_count} 个模块")
+            logger.info(f"  禁用量化: {disabled_count} 个模块")
+    # ==========================================
+
+    # 4. 禁用特定层量化
     if hasattr(model, "disable_svtr_quantization"):
         model.disable_svtr_quantization()
+    # if hasattr(model, "disable_lab_quantization"):
+    #     model.disable_lab_quantization()
 
-    model.fuse_model(is_qat=True)  # type: ignore[operator]
+    # for name, module in model.named_modules():
+    #     print(f"{name}, {module.qconfig is not None}")
+    # exit()
+
+    # 5. prepare_qat（使用 inplace=True）
     qat_model = torch.ao.quantization.prepare_qat(model, inplace=False)
     logger.info("=== QAT模型准备完成 ===")
-
-    # 如果模型有禁用量化的方法，调用它
-    if hasattr(model, "disable_lab_quantization"):
-        qat_model.disable_lab_quantization()
     return qat_model
 
 
@@ -211,10 +272,66 @@ class QuantTrainer(object):
         for name, layer in rep_layers:
             if hasattr(layer, "rep") and not getattr(layer, "is_repped"):
                 layer.rep()
+        torch.cuda.empty_cache()  # 释放显存
         _replace_relu(self.model)
 
         self.original_model = copy.deepcopy(self.model)
-        self.model = prepare_qat_model(self.model, "fbgemm", self.logger)
+        self.model = prepare_qat_model(self.model, "fbgemm", self.logger, 
+            [
+                # 'decoder',
+                'decoder.fc',
+                'decoder.fc_quant',
+                'decoder.fc_dequant',
+                'decoder.svtr_encoder',
+                # 'encoder.blocks3.0.dw_conv.reparam_conv',
+                # 'encoder.blocks3.0.pw_conv.reparam_conv',
+                # 'encoder.blocks3.1.dw_conv.reparam_conv',
+                # 'encoder.blocks3.1.pw_conv.reparam_conv',
+                # 'encoder.blocks4.0.dw_conv.reparam_conv',
+                # 'encoder.blocks4.0.pw_conv.reparam_conv',
+                # 'encoder.blocks4.1.dw_conv.reparam_conv',
+                # 'encoder.blocks4.1.pw_conv.reparam_conv',
+                # 'encoder.blocks5.0.dw_conv.reparam_conv',
+                # 'encoder.blocks5.0.pw_conv.reparam_conv',
+                # 'encoder.blocks5.1.dw_conv.reparam_conv',
+                # 'encoder.blocks5.1.pw_conv.reparam_conv',
+                # 'encoder.blocks5.2.dw_conv.reparam_conv',
+                # 'encoder.blocks5.2.pw_conv.reparam_conv',
+                # 'encoder.blocks5.2.pw_conv.conv_quant',
+                # 'encoder.blocks5.2.pw_conv.conv_dequant',
+                # 'encoder.blocks5.3.dw_conv.reparam_conv',
+                # 'encoder.blocks5.3.pw_conv.reparam_conv',
+                # 'encoder.blocks5.3.pw_conv.conv_quant',
+                # 'encoder.blocks5.3.pw_conv.conv_dequant',
+                # 'encoder.blocks5.4.dw_conv.reparam_conv',
+                # 'encoder.blocks5.4.pw_conv.reparam_conv',
+                # 'encoder.blocks5.4.pw_conv.conv_quant',
+                # 'encoder.blocks5.4.pw_conv.conv_dequant',
+                # 'encoder.blocks6.0.dw_conv.reparam_conv',
+                # 'encoder.blocks6.0.dw_conv.conv_quant',
+                # 'encoder.blocks6.0.dw_conv.conv_dequant',
+                'encoder.blocks6.0.pw_conv.reparam_conv',
+                'encoder.blocks6.0.pw_conv.conv_quant',
+                'encoder.blocks6.0.pw_conv.conv_dequant',
+                # 'encoder.blocks6.1.dw_conv.reparam_conv',
+                # 'encoder.blocks6.1.dw_conv.conv_quant',
+                # 'encoder.blocks6.1.dw_conv.conv_dequant',
+                'encoder.blocks6.1.pw_conv.reparam_conv',
+                'encoder.blocks6.1.pw_conv.conv_quant',
+                'encoder.blocks6.1.pw_conv.conv_dequant',
+                # 'encoder.blocks6.2.dw_conv.reparam_conv',
+                # 'encoder.blocks6.2.dw_conv.conv_quant',
+                # 'encoder.blocks6.2.dw_conv.conv_dequant',
+                'encoder.blocks6.2.pw_conv.reparam_conv',
+                'encoder.blocks6.2.pw_conv.conv_quant',
+                'encoder.blocks6.2.pw_conv.conv_dequant',
+                'encoder.blocks6.3.dw_conv.reparam_conv',
+                'encoder.blocks6.3.dw_conv.conv_quant',
+                'encoder.blocks6.3.dw_conv.conv_dequant',
+                'encoder.blocks6.3.pw_conv.reparam_conv',
+                'encoder.blocks6.3.pw_conv.conv_quant',
+                'encoder.blocks6.3.pw_conv.conv_dequant',
+        ])
         self.logger.info('[QAT]: backend fbgemm, preparing model success!')
 
         if self.cfg['Global']['distributed']:
@@ -253,6 +370,13 @@ class QuantTrainer(object):
         """
         self.logger.info("[QAT]: Start Converting ...")
         self.model = self.model.to("cpu")
+
+        checkpoint = torch.load(os.path.join(self.cfg['Global']['output_dir'], "best.pth"),
+            map_location=torch.device("cpu"),
+            weights_only=True,
+        )
+        self.model.load_state_dict(checkpoint["state_dict"], strict=True)
+
         self.model.eval()
         quantized_model = torch.quantization.convert(self.model, inplace=False)
         self.logger.info("[QAT]: Converting Success!")
@@ -262,6 +386,14 @@ class QuantTrainer(object):
         )
         torch.save(quantized_model.state_dict(), quantized_save_path)
         self.logger.info(f"[QAT]: Model has been saved in: {quantized_save_path}")
+
+        example_inputs = torch.rand(1, 3, 48, 320).to("cpu")
+        debug_quantized_model(quantized_model, example_inputs)
+        dynamic_axes = [0, 3]
+        export_onnx_model(quantized_model, example_inputs, dynamic_axes, os.path.join(
+            self.cfg['Global']['output_dir'], 
+            'quantized_inference_model.onnx'
+        ))
         return quantized_model
 
     def load_params(self, params):
@@ -370,7 +502,7 @@ class QuantTrainer(object):
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    preds = self.model(batch_tensor[0], data=batch_tensor[1:])
+                    preds = self.model(batch_tensor[0])
                     loss = self.loss_class(preds, batch_tensor)
                     avg_loss = loss['loss']
                     avg_loss.backward()
@@ -466,7 +598,8 @@ class QuantTrainer(object):
         self.logger.info(best_str)
 
         # 在分布式清理之前完成QAT转换
-        self.finalize_qat_model()
+        quantized_model = self.finalize_qat_model()
+        # self.eval(quantized_model, log=True, device="cpu")
 
         if self.writer is not None:
             self.writer.close()
@@ -475,7 +608,7 @@ class QuantTrainer(object):
             torch.distributed.destroy_process_group()
 
     def eval_step(self, global_step, epoch):
-        cur_metric = self.eval()
+        cur_metric = self.eval(self.model)
         cur_metric_str = f"cur metric, {', '.join(['{}: {}'.format(k, v) for k, v in cur_metric.items()])}"
         self.logger.info(cur_metric_str)
 
@@ -510,8 +643,8 @@ class QuantTrainer(object):
         best_str = f"best metric, {', '.join(['{}: {}'.format(k, v) for k, v in self.best_metric.items()])}"
         self.logger.info(best_str)
 
-    def eval(self):
-        self.model.eval()
+    def eval(self, model, log=False, device="cuda"):
+        model.eval()
         with torch.no_grad():
             total_frame = 0.0
             total_time = 0.0
@@ -523,16 +656,15 @@ class QuantTrainer(object):
             )
             sum_images = 0
             for idx, batch in enumerate(self.valid_dataloader):
-                batch_tensor = [t.to(self.device) for t in batch]
+                batch_tensor = [t.to(device) for t in batch]
                 batch_numpy = [t.numpy() for t in batch]
                 start = time.time()
                 if self.scaler:
                     with torch.cuda.amp.autocast(
                             enabled=self.device.type == 'cuda'):
-                        preds = self.model(batch_tensor[0],
-                                           data=batch_tensor[1:])
+                        preds = model(batch_tensor[0])
                 else:
-                    preds = self.model(batch_tensor[0], data=batch_tensor[1:])
+                    preds = model(batch_tensor[0])
 
                 total_time += time.time() - start
                 # Obtain usable results from post-processing methods
@@ -547,8 +679,12 @@ class QuantTrainer(object):
             metric = self.eval_class.get_metric()
 
         pbar.close()
-        self.model.train()
+        model.train()
         metric['fps'] = total_frame / total_time
+
+        if log:
+            cur_metric_str = f"cur metric, {', '.join(['{}: {}'.format(k, v) for k, v in metric.items()])}"
+            self.logger.info(cur_metric_str)
         return metric
 
     def test_dataloader(self):
@@ -567,3 +703,4 @@ class QuantTrainer(object):
 
             self.logger.info(traceback.format_exc())
         self.logger.info(f'finish reader: {count}, Success!')
+

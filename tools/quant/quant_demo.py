@@ -306,6 +306,12 @@ def quant_rec_model(quant_method="static"):
     if quant_method == "qat":
         qat_model = prepare_qat_model(quant_model, backend)
         qat_model = finalize_qat_model(qat_model)
+        # 可以在这里 Load 训练好的模型
+        state_dict = torch.load(
+            "./output/rec_ppocr_v4_quant/quantized_inference_model.pth", map_location="cpu", weights_only=True
+        )
+        qat_model.load_state_dict(state_dict)
+        print("=== 模型参数加载完成 ===")
         debug_quantized_model(qat_model, example_inputs)
         export_onnx_model(
             qat_model, example_inputs, dynamic_axes, "./output/PPOCR-v4-qat-quant.onnx"

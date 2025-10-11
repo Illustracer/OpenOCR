@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from typing import Any, Optional, Union
 from openrec.modeling.common import Mlp
-from openrec.modeling.encoders.svtrnet import Attention, ConvBNLayer
+from openrec.modeling.encoders.svtrnet import Attention, ConvBNLayer, Block
 from openrec.modeling.decoders.ctc_decoder import EncoderWithSVTR, CTCDecoder
 
 
@@ -24,6 +25,73 @@ def _fuse_modules(
     return method(model, modules_to_fuse, **kwargs)
 
 
+class QuantizedAttention(Attention):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        mixer='Global',
+        HW=None,
+        local_k=[7, 11],
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+    ):
+        super().__init__(
+            dim=dim,
+            num_heads=num_heads,
+            mixer=mixer,
+            HW=HW,
+            local_k=local_k,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+
+        # qkv 前后的量化/反量化
+        self.quant_qkv = torch.quantization.QuantStub()
+        self.dequant_qkv = torch.quantization.DeQuantStub()
+        
+        # proj 前后的量化/反量化
+        self.quant_proj = torch.quantization.QuantStub()
+        self.dequant_proj = torch.quantization.DeQuantStub()
+
+    def forward(self, x):
+        B, N, _ = x.shape
+
+        # qkv 量化计算
+        x = self.quant_qkv(x)      # 量化输入
+        qkv = self.qkv(x)           # 量化的 Linear
+        qkv = self.dequant_qkv(qkv) # 反量化输出
+
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        if self.mixer == 'Local':
+            attn += self.mask
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, self.dim)
+
+        # proj 量化计算
+        x = self.quant_proj(x)      # 量化输入
+        x = self.proj(x)            # 量化的 Linear
+        x = self.dequant_proj(x)    # 反量化输出
+
+        x = self.proj_drop(x)
+        return x
+
+    def disable_svtr_quantization(self):
+        self.attn_drop.qconfig = None
+        self.proj_drop.qconfig = None
+
+
 class QuantizedMlp(Mlp):
     # MLP 模型无需编写量化代码
     def __init__(
@@ -36,17 +104,32 @@ class QuantizedMlp(Mlp):
     ):
         super().__init__(in_features, hidden_features, out_features, act_layer, drop)
 
+        self.quant1 = torch.quantization.QuantStub()
+        self.dequant1 = torch.quantization.DeQuantStub()
+        self.quant2 = torch.quantization.QuantStub()
+        self.dequant2 = torch.quantization.DeQuantStub()
+
     def forward(self, x):
+        x = self.quant1(x)
         x = self.fc1(x)
+        x = self.dequant1(x)
         x = self.act(x)
         x = self.drop(x)
+        x = self.quant2(x)
         x = self.fc2(x)
+        x = self.dequant2(x)
         x = self.drop(x)
         return x
 
     def fuse_model(self, is_qat=None):
         """无需融合"""
         pass
+
+    def disable_svtr_quantization(self):
+        self.act.qconfig = None
+        for module in self.act.modules():
+            module.qconfig = None
+        self.drop.qconfig = None
 
 
 class QuantizedConvBNLayer(ConvBNLayer):
@@ -76,6 +159,81 @@ class QuantizedConvBNLayer(ConvBNLayer):
     def fuse_model(self, is_qat=None):
         """融合Conv+BN操作"""
         _fuse_modules(self, [["conv", "norm"]], inplace=True, is_qat=is_qat)
+
+
+class QuantizedBlock(Block):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mixer='Global',
+        local_mixer=[7, 11],
+        HW=None,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer='nn.LayerNorm',
+        eps=1e-6,
+        prenorm=True,
+    ):
+        super().__init__(
+            dim=dim,
+            num_heads=num_heads,
+            mixer=mixer,
+            local_mixer=local_mixer,
+            HW=HW,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop=drop,
+            attn_drop=attn_drop,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            eps=eps,
+            prenorm=prenorm,
+        )
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = QuantizedMlp(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop,
+        )
+
+        if mixer == 'Global' or mixer == 'Local':
+            self.mixer = QuantizedAttention(
+                dim,
+                num_heads=num_heads,
+                mixer=mixer,
+                HW=HW,
+                local_k=local_mixer,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+            )
+
+    def forward(self, x):
+        if self.prenorm:
+            x = self.norm1(x + self.drop_path(self.mixer(x)))
+            x = self.norm2(x + self.drop_path(self.mlp(x)))
+        else:
+            x = x + self.drop_path(self.mixer(self.norm1(x)))
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+    def disable_svtr_quantization(self):
+        self.mlp.disable_svtr_quantization()
+        self.mixer.disable_svtr_quantization()
+        self.drop_path.qconfig = None
+        self.norm1.qconfig = None
+        self.norm2.qconfig = None
 
 
 class QuantizedEncoderWithSVTR(EncoderWithSVTR):
@@ -153,11 +311,31 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
             in_channels // 8, dims, kernel_size=1, act="swish", bias=False
         )
 
+        self.svtr_block = nn.ModuleList([
+            QuantizedBlock(
+                dim=hidden_dims,
+                num_heads=num_heads,
+                mixer='Global',
+                HW=None,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                act_layer='swish',
+                attn_drop=attn_drop_rate,
+                drop_path=drop_path,
+                norm_layer='nn.LayerNorm',
+                eps=1e-05,
+                prenorm=False,
+            ) for i in range(depth)
+        ])
+
         # 添加量化相关的FloatFunctional操作
         self.cat_func = torch.nn.quantized.FloatFunctional()  # 用于torch.concat
 
-        # svtr_block和norm保持原样，不进行量化
-        # 为Block模块添加量化/反量化保护
+        self.input_quant = torch.quantization.QuantStub()
+        self.input_dequant = torch.quantization.DeQuantStub()
+
         self.block_dequant = torch.quantization.DeQuantStub()
         self.block_quant = torch.quantization.QuantStub()
 
@@ -171,6 +349,7 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         else:
             z = x
 
+        z = self.input_quant(z)
         # for short cut
         h = z
 
@@ -197,6 +376,8 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         # 使用FloatFunctional进行concat操作
         z = self.cat_func.cat([h, z], dim=1)
         z = self.conv1x1(self.conv4(z))
+
+        z = self.input_dequant(z)
         return z
 
     def fuse_model(self, is_qat=None):
@@ -216,9 +397,7 @@ class QuantizedEncoderWithSVTR(EncoderWithSVTR):
         # 禁用SVTR blocks
         for blk in self.svtr_block:
             blk.qconfig = None
-            # 递归禁用block内部的所有子模块
-            for module in blk.modules():
-                module.qconfig = None
+            blk.disable_svtr_quantization()
 
 
 class QuantizedCTCDecoder(CTCDecoder):
@@ -246,21 +425,17 @@ class QuantizedCTCDecoder(CTCDecoder):
             super().__init__(in_channels, out_channels, mid_channels, return_feats, svtr_encoder, **kwargs)
 
         # 添加量化控制
-        self.input_quant = torch.quantization.QuantStub()
-        self.output_dequant = torch.quantization.DeQuantStub()
-
-        # 为softmax添加量化控制
-        self.softmax_dequant = torch.quantization.DeQuantStub()
-        self.softmax_quant = torch.quantization.QuantStub()
+        self.fc_quant = torch.quantization.QuantStub()
+        self.fc_dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x):
-        # 输入量化
-        x = self.input_quant(x)
-
         # SVTR编码器处理（如果存在）
         if self.svtr_encoder is not None:
             x = self.svtr_encoder(x)
             x = x.flatten(2).transpose(1, 2)
+
+        # 输入量化
+        x = self.fc_quant(x)
 
         # 全连接层处理
         if self.mid_channels is None:
@@ -269,20 +444,21 @@ class QuantizedCTCDecoder(CTCDecoder):
             x = self.fc1(x)
             predicts = self.fc2(x)
 
+        # 反量化
+        predicts = self.fc_dequant(predicts)
+
         # 返回结果处理
         if self.return_feats:
             # 反量化用于返回
-            x_float = self.output_dequant(x.clone())
-            predicts_float = self.output_dequant(predicts.clone())
-            result = (x_float, predicts_float)
+            x_float = self.fc_dequant(x.clone())
+            result = (x_float, predicts)
         else:
             result = predicts
 
         # 推理时的softmax
         if not self.training:
-            predicts_float = self.softmax_dequant(predicts)
-            predicts_float = F.softmax(predicts_float, dim=2)
-            result = predicts_float  # softmax结果通常需要浮点精度
+            predicts = F.softmax(predicts, dim=2)
+            result = predicts
 
         return result
 
@@ -291,128 +467,6 @@ class QuantizedCTCDecoder(CTCDecoder):
         if self.svtr_encoder is not None:
             self.svtr_encoder.fuse_model(is_qat)
 
-        # Linear层通常不需要特殊的融合操作
-        # 但如果需要，可以在这里添加
-
     def disable_svtr_quantization(self):
         """禁用SVTR相关模块的量化"""
         self.svtr_encoder.disable_svtr_quantization()
-
-
-class QuantizedEncoderModel(nn.Module):
-    # example_inputs = torch.rand(1, 512, 48, 320).to("cpu")
-    def __init__(self, in_channels=512, dims=64):
-        super().__init__()
-        self.quant = torch.quantization.QuantStub()
-        self.encoder = QuantizedEncoderWithSVTR(
-            in_channels=in_channels,
-            dims=dims,
-            depth=2,
-            hidden_dims=120,
-            use_guide=False,
-            num_heads=8,
-            qkv_bias=True,
-            mlp_ratio=2.0,
-            drop_rate=0.1,
-            attn_drop_rate=0.1,
-            drop_path=0.0,
-            kernel_size=[3, 3],
-            qk_scale=None,
-            use_pool=True,
-            support_ppocr_v4=False,
-        )
-        self.dequant = torch.quantization.DeQuantStub()
-
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.encoder(x)
-        x = self.dequant(x)
-        return x
-
-    def fuse_model(self, is_qat=None):
-        """融合"""
-        self.encoder.fuse_model(is_qat)
-
-    def disable_svtr_quantization(self):
-        """禁用SVTR相关模块的量化"""
-        self.encoder.disable_svtr_quantization()
-
-
-class QuantizedConvBNModel(nn.Module):
-    # example_inputs = torch.rand(1, 3, 48, 320).to("cpu")
-    def __init__(self, in_channels=3, out_channels=64):
-        super().__init__()
-        self.quant = torch.quantization.QuantStub()
-        self.conv_bn = QuantizedConvBNLayer(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-            groups=1,
-            act="swish",
-        )
-        self.dequant = torch.quantization.DeQuantStub()
-
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.conv_bn(x)
-        x = self.dequant(x)
-        return x
-
-    def fuse_model(self, is_qat=None):
-        """融合"""
-        self.conv_bn.fuse_model(is_qat)
-
-
-class QuantizedModel(nn.Module):
-    # 测试量化 MLP 模块
-    # NOTE: 这个可以直接量化
-    # example_inputs = torch.rand(1, 128, 768).to("cpu")
-    def __init__(self):
-        super().__init__()
-        self.quant = torch.quantization.QuantStub()
-        self.mlp_block = QuantizedMlp(768, 3072, 768, nn.GELU, 0.1)
-        self.dequant = torch.quantization.DeQuantStub()
-
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.mlp_block(x)
-        x = self.dequant(x)
-        return x
-
-    def fuse_model(self, is_qat=None):
-        """无需融合"""
-        pass
-
-
-class QuantizedAttentionModel(nn.Module):
-    # 测试量化 Attention 模块
-    # example_inputs = torch.rand(1, 128, 768).to("cpu")
-    # NOTE: 不支持 q = q * self.scale
-    # 需要写 self.mul_scale = torch.nn.quantized.FloatFunctional()
-    # 但是不支持导出 ONNX
-    def __init__(self, dim=768, num_heads=12, HW=None, mixer="Global"):
-        super().__init__()
-        self.quant = torch.quantization.QuantStub()
-        self.attention = Attention(
-            dim=dim,
-            num_heads=num_heads,
-            mixer=mixer,
-            HW=HW,
-            qkv_bias=True,
-            attn_drop=0.1,
-            proj_drop=0.1,
-        )
-        self.dequant = torch.quantization.DeQuantStub()
-
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.attention(x)
-        x = self.dequant(x)
-        return x
-
-    def fuse_model(self, is_qat=None):
-        """无需融合"""
-        pass

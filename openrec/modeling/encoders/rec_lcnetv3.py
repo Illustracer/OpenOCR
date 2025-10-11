@@ -199,6 +199,16 @@ class LearnableRepLayer(nn.Module):
         )
         self.reparam_conv.weight.data = kernel
         self.reparam_conv.bias.data = bias
+
+        # 删除原始分支（释放显存）
+        for para in self.parameters():
+            para.detach_()  # 先detach，避免计算图问题
+
+        self.__delattr__('conv_kxk')
+        if hasattr(self, 'conv_1x1') and self.conv_1x1 is not None:
+            self.__delattr__('conv_1x1')
+        if hasattr(self, 'identity') and self.identity is not None:
+            self.__delattr__('identity')
         self.is_repped = True
 
     def _pad_kernel_1x1_to_kxk(self, kernel1x1, pad):

@@ -157,7 +157,7 @@ if __name__ == "__main__":
     summary(converter.net, (3, 48, 320))
 
     os.makedirs(args.export_dir, exist_ok=True)
-    converter.save_pytorch_weights(weights_path=os.path.join(args.export_dir, "ppocr_v4_rec.pth"))
+    converter.save_pytorch_weights(weights_path=os.path.join(args.export_dir, "ppocr_v4_rec_add_dict.pth"))
 
     # 导出 onnx
     if args.export_onnx_model:

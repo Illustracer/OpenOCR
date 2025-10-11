@@ -39,7 +39,10 @@ def main():
         trainer = Trainer(cfg,
                         mode='train_eval' if FLAGS['eval'] else 'train',
                         task='rec')
-    trainer.train()
+    qat_model, _ = trainer.model, trainer.original_model
+    trainer.eval(qat_model, log=True)
+    # trainer.finalize_qat_model()
+    # trainer.train()
 
 
 if __name__ == '__main__':
