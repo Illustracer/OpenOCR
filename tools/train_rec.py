@@ -41,8 +41,8 @@ def main():
                         task='rec')
     qat_model, _ = trainer.model, trainer.original_model
     trainer.eval(qat_model, log=True)
-    # trainer.finalize_qat_model()
-    # trainer.train()
+    # trainer.finalize_qat_model(load_checkpoint=False)
+    trainer.train()
 
 
 if __name__ == '__main__':

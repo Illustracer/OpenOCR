@@ -279,10 +279,10 @@ class QuantTrainer(object):
         self.model = prepare_qat_model(self.model, "fbgemm", self.logger, 
             [
                 # 'decoder',
-                'decoder.fc',
-                'decoder.fc_quant',
-                'decoder.fc_dequant',
-                'decoder.svtr_encoder',
+                # 'decoder.fc',
+                # 'decoder.fc_quant',
+                # 'decoder.fc_dequant',
+                # 'decoder.svtr_encoder',
                 # 'encoder.blocks5.0.dw_conv.reparam_conv',
                 # 'encoder.blocks5.0.pw_conv.reparam_conv',
                 # 'encoder.blocks5.1.dw_conv.reparam_conv',
@@ -317,12 +317,12 @@ class QuantTrainer(object):
                 # 'encoder.blocks6.2.pw_conv.reparam_conv',
                 # 'encoder.blocks6.2.pw_conv.conv_quant',
                 # 'encoder.blocks6.2.pw_conv.conv_dequant',
-                'encoder.blocks6.3.dw_conv.reparam_conv',
-                'encoder.blocks6.3.dw_conv.conv_quant',
-                'encoder.blocks6.3.dw_conv.conv_dequant',
-                'encoder.blocks6.3.pw_conv.reparam_conv',
-                'encoder.blocks6.3.pw_conv.conv_quant',
-                'encoder.blocks6.3.pw_conv.conv_dequant',
+                # 'encoder.blocks6.3.dw_conv.reparam_conv',
+                # 'encoder.blocks6.3.dw_conv.conv_quant',
+                # 'encoder.blocks6.3.dw_conv.conv_dequant',
+                # 'encoder.blocks6.3.pw_conv.reparam_conv',
+                # 'encoder.blocks6.3.pw_conv.conv_quant',
+                # 'encoder.blocks6.3.pw_conv.conv_dequant',
         ])
         self.logger.info('[QAT]: backend fbgemm, preparing model success!')
 
@@ -356,18 +356,19 @@ class QuantTrainer(object):
         # build metric
         self.eval_class = build_rec_metric(self.cfg['Metric'])
 
-    def finalize_qat_model(self):
+    def finalize_qat_model(self, load_checkpoint=True):
         """
         完成QAT训练后, 转换为最终的量化模型
         """
         self.logger.info("[QAT]: Start Converting ...")
         self.model = self.model.to("cpu")
 
-        # checkpoint = torch.load(os.path.join(self.cfg['Global']['output_dir'], "best.pth"),
-        #     map_location=torch.device("cpu"),
-        #     weights_only=True,
-        # )
-        # self.model.load_state_dict(checkpoint["state_dict"], strict=True)
+        if load_checkpoint:
+            checkpoint = torch.load(os.path.join(self.cfg['Global']['output_dir'], "best.pth"),
+                map_location=torch.device("cpu"),
+                weights_only=True,
+            )
+            self.model.load_state_dict(checkpoint["state_dict"], strict=True)
 
         self.model.eval()
         quantized_model = torch.quantization.convert(self.model, inplace=False)
